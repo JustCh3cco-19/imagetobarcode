@@ -1,0 +1,5 @@
+# DOC WIP
+## Creare eseguibile
+```python
+pyInstaller --clean --onefile --noconsole --name imagetobarcode --hidden-import=PIL._tkinter_finder --hidden-import=tkinter --hidden-import=qrcode --hidden-import=qrcode.image.pil --hidden-import=qrcode.image.svg --hidden-import=qrcode.image.pure --collect-submodules=barcode --add-binary "vendor\tesseract\tesseract.exe;." --add-binary "vendor\tesseract\libtesseract-5.dll;." --add-binary "vendor\tesseract\libleptonica-6.dll;." --add-binary "vendor\tesseract\libcurl-4.dll;." --add-binary "vendor\tesseract\libarchive-13.dll;." --add-binary "vendor\tesseract\libtiff-6.dll;." --add-binary "vendor\tesseract\libgcc_s_seh-1.dll;." --add-binary "vendor\tesseract\libstdc++-6.dll;." --add-data "vendor\tesseract\tessdata;tessdata" --add-data "vendor\fonts\DejaVuSans.ttf;fonts" src\main.py
+```

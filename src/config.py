@@ -1,4 +1,4 @@
-APP_TITLE = "OCR · Code39/QR Generator"
+APP_TITLE = "OCR → QR Generator"
 
 SUPPORTED_IMAGES = (
     ".png",
@@ -9,4 +9,3 @@ SUPPORTED_IMAGES = (
     ".tiff",
     ".webp",
 )
-
