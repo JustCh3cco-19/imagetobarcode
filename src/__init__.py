@@ -1,4 +1,0 @@
-"""
-imagetobarcode src package.
-"""
-
