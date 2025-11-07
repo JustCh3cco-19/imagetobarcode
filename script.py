@@ -7,26 +7,20 @@ from io import BytesIO
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from PIL import Image, ImageTk, ImageOps
-
-# Dipendenze: pip install pillow pytesseract python-barcode
 import pytesseract
 import barcode
 from barcode.writer import ImageWriter
+import qrcode
 
-
-APP_TITLE = "OCR ➜ Code39 Generator"
+APP_TITLE = "OCR ➜ Code39/QR Generator"
 SUPPORTED_IMAGES = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")
 
 
 def bundle_base_dir() -> Path:
-    try:
-        return Path(sys._MEIPASS)  # type: ignore[attr-defined]
-    except Exception:
-        return Path(__file__).resolve().parent
+    return Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 
 
 def configure_embedded_tesseract():
-    """Imposta automaticamente il percorso di Tesseract."""
     try:
         _ = pytesseract.get_tesseract_version()
         return
@@ -34,25 +28,61 @@ def configure_embedded_tesseract():
         pass
 
     base = bundle_base_dir()
+    is_windows = os.name == "nt"
+
+    if getattr(sys, "frozen", False):
+        exe = base / ("tesseract.exe" if is_windows else "tesseract")
+        if exe.exists():
+            pytesseract.pytesseract.tesseract_cmd = str(exe)
+            os.environ["PATH"] = os.pathsep.join([str(exe.parent), os.environ.get("PATH", "")])
+            td = base / "tessdata"
+            if td.is_dir():
+                os.environ["TESSDATA_PREFIX"] = str(td)
+            pytesseract.get_tesseract_version()
+            return
+
     candidates = [
-        Path("/usr/bin/tesseract"),
+        base / "vendor" / "tesseract" / ("tesseract.exe" if is_windows else "tesseract"),
+        Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe") if is_windows else Path("/usr/bin/tesseract"),
         Path("/usr/local/bin/tesseract"),
-        base / "tesseract",
-        base / "vendor" / "tesseract" / "tesseract",
     ]
     for exe in candidates:
         if exe.exists():
             pytesseract.pytesseract.tesseract_cmd = str(exe)
-            tessdata_candidates = [
-                Path("/usr/share/tesseract-ocr/4.00/tessdata"),
-                Path("/usr/share/tesseract-ocr/5/tessdata"),
+            os.environ["PATH"] = os.pathsep.join([str(exe.parent), os.environ.get("PATH", "")])
+            for td in (
                 exe.parent / "tessdata",
-            ]
-            for td in tessdata_candidates:
+                base / "vendor" / "tesseract" / "tessdata",
+                base / "tessdata",
+                Path(r"C:\Program Files\Tesseract-OCR\tessdata") if is_windows else Path("/usr/share/tesseract-ocr/5/tessdata"),
+                Path("/usr/share/tesseract-ocr/4.00/tessdata"),
+            ):
                 if td.is_dir():
                     os.environ["TESSDATA_PREFIX"] = str(td)
                     break
-            break
+            pytesseract.get_tesseract_version()
+            return
+
+
+# ---- FONT per python-barcode ----
+def get_font_path() -> str | None:
+    """
+    Restituisce il path di un font TTF incluso nel bundle.
+    Metti ad es. 'DejaVuSansMono.ttf' in:
+      - vendor/fonts/DejaVuSansMono.ttf   (in sviluppo)
+      - <MEIPASS>/fonts/DejaVuSansMono.ttf (nel bundle)
+    """
+    base = bundle_base_dir()
+    candidates = [
+        base / "fonts" / "DejaVuSansMono.ttf",
+        base / "fonts" / "DejaVuSans.ttf",
+        base / "vendor" / "fonts" / "DejaVuSansMono.ttf",
+        base / "vendor" / "fonts" / "DejaVuSans.ttf",
+    ]
+    for p in candidates:
+        if p.exists():
+            return str(p)
+    return None
 
 
 configure_embedded_tesseract()
@@ -72,6 +102,7 @@ class App(tk.Tk):
         self.tk_generated_preview: ImageTk.PhotoImage | None = None
 
         self.lang_var = tk.StringVar(value="eng")
+        self.code_type_var = tk.StringVar(value="code39")
         self._build_ui()
 
     # ---------------- UI ----------------
@@ -88,63 +119,58 @@ class App(tk.Tk):
         main = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
         main.pack(fill=tk.BOTH, expand=True)
 
-        # --- Sinistra: immagine ---
+        # Sinistra
         left = ttk.Frame(main, padding=8)
         main.add(left, weight=1)
         ttk.Label(left, text="Anteprima immagine").pack()
         self.canvas_in = tk.Canvas(left, background="#f3f3f3", highlightthickness=1, height=360)
         self.canvas_in.pack(fill=tk.BOTH, expand=True)
 
-        # --- Centro: testo OCR ---
+        # Centro
         center = ttk.Frame(main, padding=(8, 8, 8, 0))
         main.add(center, weight=1)
-
-        # Barra strumenti testo
         bar = ttk.Frame(center)
         bar.pack(fill=tk.X)
         ttk.Button(bar, text="Esegui OCR", command=self.on_run_ocr).pack(side=tk.LEFT)
         ttk.Button(bar, text="↶ Annulla", command=lambda: self.safe_undo()).pack(side=tk.LEFT, padx=4)
         ttk.Button(bar, text="↷ Ripristina", command=lambda: self.safe_redo()).pack(side=tk.LEFT)
-
-        # Text widget con undo abilitato
         self.text_widget = tk.Text(center, undo=True, wrap="word")
         self.text_widget.pack(fill=tk.BOTH, expand=True)
         self.text_widget.insert("1.0", "Testo OCR apparirà qui…")
-
-        # Shortcuts Undo/Redo
         self.text_widget.bind("<Control-z>", lambda e: self.safe_undo())
         self.text_widget.bind("<Control-y>", lambda e: self.safe_redo())
 
-        # --- Destra: generazione codice ---
+        # Destra
         right = ttk.Frame(main, padding=8)
         main.add(right, weight=1)
-
-        # Campi Larghezza e Altezza verticali
-        self.w_var = tk.IntVar(value=800)
-        self.h_var = tk.IntVar(value=240)
+        
+        # Selezione tipo codice
+        ttk.Label(right, text="Tipo codice:").pack(anchor="w")
+        code_frame = ttk.Frame(right)
+        code_frame.pack(anchor="w", pady=(0, 10))
+        ttk.Radiobutton(code_frame, text="Code39", variable=self.code_type_var, value="code39").pack(side=tk.LEFT)
+        ttk.Radiobutton(code_frame, text="QR Code", variable=self.code_type_var, value="qrcode").pack(side=tk.LEFT, padx=10)
+        
+        self.w_var = tk.IntVar(value=1920)
+        self.h_var = tk.IntVar(value=1080)
         ttk.Label(right, text="Larghezza px:").pack(anchor="w")
         ttk.Entry(right, width=10, textvariable=self.w_var).pack(anchor="w", pady=(0, 6))
         ttk.Label(right, text="Altezza px:").pack(anchor="w")
         ttk.Entry(right, width=10, textvariable=self.h_var).pack(anchor="w", pady=(0, 10))
-
-        # Pulsante principale con wrapping automatico
-        btn_code = tk.Button(
+        tk.Button(
             right,
-            text="Genera Code39 dal testo selezionato",
-            command=self.on_generate_code39,
+            text="Genera codice dal testo selezionato",
+            command=self.on_generate_code,
             wraplength=180,
             justify="center",
             font=("Segoe UI", 9, "bold"),
-        )
-        btn_code.pack(fill=tk.X, pady=6, ipadx=4, ipady=5)
-
+        ).pack(fill=tk.X, pady=6, ipadx=4, ipady=5)
         ttk.Button(right, text="Salva immagine…", command=self.on_save).pack(fill=tk.X)
-
         ttk.Label(right, text="Anteprima codice").pack(anchor="w", pady=(12, 6))
         self.canvas_out = tk.Canvas(right, background="#f9f9f9", highlightthickness=1, height=240)
         self.canvas_out.pack(fill=tk.BOTH, expand=False)
 
-    # ---------------- Funzioni di utilità ----------------
+    # -------- util --------
     def _tesseract_status_text(self) -> str:
         try:
             ver = pytesseract.get_tesseract_version()
@@ -153,20 +179,18 @@ class App(tk.Tk):
             return "Tesseract: NON trovato"
 
     def safe_undo(self):
-        """Evita errori 'nothing to undo'."""
         try:
             self.text_widget.edit_undo()
         except tk.TclError:
             pass
 
     def safe_redo(self):
-        """Evita errori 'nothing to redo'."""
         try:
             self.text_widget.edit_redo()
         except tk.TclError:
             pass
 
-    # ---------------- Logica ----------------
+    # -------- logica --------
     def toggle_lang(self):
         new_lang = "ita" if self.lang_var.get() == "eng" else "eng"
         self.lang_var.set(new_lang)
@@ -183,7 +207,6 @@ class App(tk.Tk):
         try:
             img = Image.open(path)
             self.loaded_image = ImageOps.exif_transpose(img.convert("RGB"))
-            self.input_image_path = Path(path)
             self._render_input_preview()
         except Exception as e:
             messagebox.showerror("Errore", str(e))
@@ -222,9 +245,14 @@ class App(tk.Tk):
     def _fail_ocr(self, err):
         messagebox.showerror("Errore OCR", str(err))
 
-    # -------- Generazione codice --------
+    # -------- Generazione codici --------
+    def on_generate_code(self):
+        if self.code_type_var.get() == "code39":
+            self.on_generate_code39()
+        else:
+            self.on_generate_qrcode()
+
     def on_generate_code39(self):
-        """Genera un barcode Code39 dal testo selezionato."""
         try:
             selected_text = self.text_widget.selection_get().strip()
         except tk.TclError:
@@ -236,22 +264,25 @@ class App(tk.Tk):
 
         allowed = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ -. $/+%"
         cleaned = "".join(ch for ch in selected_text.upper() if ch in allowed)
-
-        if cleaned != selected_text.upper():
-            messagebox.showinfo(
-                "Testo adattato",
-                "Alcuni caratteri non sono ammessi in Code39 e sono stati rimossi automaticamente.",
-            )
-
         if not cleaned:
             messagebox.showerror("Errore", "Il testo non contiene caratteri validi per Code39.")
             return
 
         try:
             cls = barcode.get_barcode_class("code39")
-            code = cls(cleaned, writer=ImageWriter())
+            writer = ImageWriter()
+            options = {"write_text": True}
+
+            font_path = get_font_path()
+            if font_path:
+                options["font_path"] = font_path
+            else:
+                # se nessun font bundle, disattiva il testo per evitare l'errore "cannot open resource"
+                options["write_text"] = False
+
+            code = cls(cleaned, writer=writer)
             buf = BytesIO()
-            code.write(buf, options={"write_text": True})
+            code.write(buf, options=options)
             buf.seek(0)
             img = Image.open(buf).convert("RGB")
             img = ImageOps.contain(img, (self.w_var.get(), self.h_var.get()))
@@ -259,6 +290,34 @@ class App(tk.Tk):
             self._render_output_preview()
         except Exception as e:
             messagebox.showerror("Errore generazione", str(e))
+
+    def on_generate_qrcode(self):
+        try:
+            selected_text = self.text_widget.selection_get().strip()
+        except tk.TclError:
+            selected_text = ""
+
+        if not selected_text:
+            messagebox.showwarning("Nessuna selezione", "Seleziona prima una parte di testo da convertire.")
+            return
+
+        try:
+            qr = qrcode.QRCode(
+                version=1,
+                error_correction=qrcode.constants.ERROR_CORRECT_L,
+                box_size=10,
+                border=4,
+            )
+            qr.add_data(selected_text)
+            qr.make(fit=True)
+            
+            img = qr.make_image(fill_color="black", back_color="white")
+            img = img.convert("RGB")
+            img = ImageOps.contain(img, (self.w_var.get(), self.h_var.get()))
+            self.generated_image = img
+            self._render_output_preview()
+        except Exception as e:
+            messagebox.showerror("Errore generazione QR", str(e))
 
     def _render_output_preview(self):
         if not self.generated_image:
