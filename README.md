@@ -22,15 +22,22 @@ python -m src.main
 ## Eseguibile (PyInstaller)
 Esempio di comando (adatta i percorsi dei binari Tesseract presenti in `vendor/tesseract` se li includi nel bundle):
 ```
-pyInstaller --clean --onefile --noconsole --name lettore-etichette \
-  --hidden-import=PIL._tkinter_finder --hidden-import=tkinter \
-  --hidden-import=qrcode --hidden-import=qrcode.image.pil \
-  --add-binary "vendor\tesseract\tesseract.exe;." \
-  --add-binary "vendor\tesseract\libtesseract-5.dll;." \
-  --add-binary "vendor\tesseract\libleptonica-6.dll;." \
-  --add-data   "vendor\tesseract\tessdata;tessdata"
+pyinstaller --clean --onefile --noconsole --name lettore-etichette `
+  --hidden-import=PIL._tkinter_finder --hidden-import=tkinter `
+  --hidden-import=qrcode --hidden-import=qrcode.image.pil `
+  --hidden-import=cv2 --collect-binaries=cv2 `
+  --add-binary "vendor\tesseract\tesseract.exe;." `
+  --add-binary "vendor\tesseract\libtesseract-5.dll;." `
+  --add-binary "vendor\tesseract\libleptonica-6.dll;." `
+  --add-binary "vendor\tesseract\libcurl-4.dll;." `
+  --add-binary "vendor\tesseract\libarchive-13.dll;." `
+  --add-binary "vendor\tesseract\libtiff-6.dll;." `
+  --add-binary "vendor\tesseract\libgcc_s_seh-1.dll;." `
+  --add-binary "vendor\tesseract\libstdc++-6.dll;." `
+  --add-data "vendor\tesseract\tessdata;tessdata" `
+  src\main.py
+
 ```
-Se vuoi usare la webcam anche da eseguibile, includi OpenCV (`opencv-python`).
 
 ## Flusso operativo
 1) Posiziona la confezione sotto la telecamera (rivolta in basso) 
