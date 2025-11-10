@@ -7,6 +7,11 @@ from tkinter import filedialog, messagebox, ttk
 
 from PIL import Image, ImageOps, ImageTk
 
+try:
+    import cv2
+except ImportError:
+    cv2 = None  # type: ignore[assignment]
+
 from .. import codegen, ocr_service
 from ..config import APP_TITLE, SUPPORTED_IMAGES
 from ..utils import bundle_base_dir
@@ -39,8 +44,20 @@ class App(tk.Tk):
         self.page2: ttk.Frame | None = None
         self._preview_job: str | None = None
         self._preview_enabled: bool = False  # anteprima disabilitata fino al click su "Esegui OCR"
+        self.camera_combo: ttk.Combobox | None = None
+        self.camera_status: ttk.Label | None = None
+        self.btn_camera_preview: ttk.Button | None = None
+        self.btn_camera_capture: ttk.Button | None = None
+        self.btn_camera_stop: ttk.Button | None = None
+        self._camera_sources: list[int] = []
+        self._selected_camera = tk.IntVar(value=-1)
+        self._camera_capture: cv2.VideoCapture | None = None
+        self._camera_preview_job: str | None = None
+        self._live_camera_image: Image.Image | None = None
 
         self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(100, self._refresh_cameras)
 
     # ---------------- UI ----------------
     def _build_ui(self):
@@ -64,6 +81,31 @@ class App(tk.Tk):
         # Pagina 1: Scegli immagine
         page1 = ttk.Frame(self.nb, padding=12)
         self.nb.add(page1, text="1. Scegli immagine")
+        cam_box = ttk.Labelframe(page1, text="Webcam", padding=(8, 6))
+        cam_box.pack(fill=tk.X, pady=(0, 8))
+        cam_row = ttk.Frame(cam_box)
+        cam_row.pack(fill=tk.X)
+        ttk.Label(cam_row, text="Sorgente:").pack(side=tk.LEFT)
+        self.camera_combo = ttk.Combobox(cam_row, state="disabled", width=28)
+        self.camera_combo.pack(side=tk.LEFT, padx=(6, 0))
+        self.camera_combo.bind("<<ComboboxSelected>>", self._on_camera_selected)
+        ttk.Button(cam_row, text="Aggiorna", command=self._refresh_cameras).pack(side=tk.LEFT, padx=4)
+        cam_btns = ttk.Frame(cam_box)
+        cam_btns.pack(fill=tk.X, pady=(6, 0))
+        self.btn_camera_preview = ttk.Button(
+            cam_btns, text="Webcam", command=self.on_start_camera_preview, state=tk.DISABLED
+        )
+        self.btn_camera_preview.pack(side=tk.LEFT)
+        self.btn_camera_capture = ttk.Button(
+            cam_btns, text="Scatta", command=self.on_capture_from_camera, state=tk.DISABLED
+        )
+        self.btn_camera_capture.pack(side=tk.LEFT, padx=4)
+        self.btn_camera_stop = ttk.Button(
+            cam_btns, text="Chiudi", command=self._stop_camera_stream, state=tk.DISABLED
+        )
+        self.btn_camera_stop.pack(side=tk.LEFT)
+        self.camera_status = ttk.Label(cam_box, text="Inizializzazione webcam...")
+        self.camera_status.pack(anchor="w", pady=(4, 0))
         ttk.Label(page1, text="Anteprima immagine").pack(anchor="w")
         self.canvas_in = tk.Canvas(page1, background="#f3f3f3", highlightthickness=1, height=380)
         self.canvas_in.pack(fill=tk.BOTH, expand=True, pady=(4, 8))
@@ -153,6 +195,7 @@ class App(tk.Tk):
             self.lang_combo.set(new_lang)
 
     def on_open_image(self):
+        self._stop_camera_stream()
         patterns = ";".join(f"*{ext}" for ext in SUPPORTED_IMAGES)
         path = filedialog.askopenfilename(
             title="Seleziona immagine",
@@ -164,29 +207,42 @@ class App(tk.Tk):
         try:
             img = Image.open(path)
             self.loaded_image = ImageOps.exif_transpose(img.convert("RGB"))
-            self._render_input_preview()
-            self._goto_step2()
-            # reset anteprima QR per nuova immagine
-            self._preview_enabled = False
-            self.generated_image = None
-            if hasattr(self, "canvas_out"):
-                try:
-                    self.canvas_out.delete("all")
-                except Exception:
-                    pass
+            self._after_new_input_image()
         except Exception as e:
             messagebox.showerror("Errore", str(e))
 
+    def _after_new_input_image(self):
+        self._render_input_preview()
+        self._goto_step2()
+        self._preview_enabled = False
+        self.generated_image = None
+        if hasattr(self, "canvas_out"):
+            try:
+                self.canvas_out.delete("all")
+            except Exception:
+                pass
+
     def _render_input_preview(self):
-        if not self.loaded_image:
+        self._draw_input_preview(self.loaded_image)
+
+    def _draw_input_preview(self, image: Image.Image | None):
+        canvas = getattr(self, "canvas_in", None)
+        if not canvas:
             return
-        cw = int(self.canvas_in.winfo_width() or 300)
-        ch = int(self.canvas_in.winfo_height() or 300)
-        img = self.loaded_image.copy()
+        if not image:
+            try:
+                canvas.delete("all")
+            except Exception:
+                pass
+            self.tk_preview = None
+            return
+        cw = int(canvas.winfo_width() or 300)
+        ch = int(canvas.winfo_height() or 300)
+        img = image.copy()
         img.thumbnail((cw - 8, ch - 8))
         self.tk_preview = ImageTk.PhotoImage(img)
-        self.canvas_in.delete("all")
-        self.canvas_in.create_image(cw // 2, ch // 2, image=self.tk_preview, anchor="center")
+        canvas.delete("all")
+        canvas.create_image(cw // 2, ch // 2, image=self.tk_preview, anchor="center")
 
     def on_run_ocr(self):
         if not self.loaded_image:
@@ -409,3 +465,167 @@ class App(tk.Tk):
                 self.nb.select(self.page2)
             except Exception:
                 pass
+
+    # -------- Webcam --------
+    def _set_camera_status(self, text: str):
+        if self.camera_status:
+            self.camera_status.config(text=text)
+
+    def _set_camera_idle(self, available: bool):
+        state_preview = tk.NORMAL if available else tk.DISABLED
+        if self.btn_camera_preview:
+            self.btn_camera_preview.config(state=state_preview)
+        if self.btn_camera_capture:
+            self.btn_camera_capture.config(state=tk.DISABLED)
+        if self.btn_camera_stop:
+            self.btn_camera_stop.config(state=tk.DISABLED)
+
+    def _set_camera_running(self):
+        if self.btn_camera_preview:
+            self.btn_camera_preview.config(state=tk.DISABLED)
+        if self.btn_camera_capture:
+            self.btn_camera_capture.config(state=tk.NORMAL)
+        if self.btn_camera_stop:
+            self.btn_camera_stop.config(state=tk.NORMAL)
+
+    def _detect_cameras(self, max_devices: int = 6) -> list[int]:
+        if cv2 is None:
+            return []
+        detected: list[int] = []
+        backend = getattr(cv2, "CAP_DSHOW", getattr(cv2, "CAP_ANY", 0))
+        for idx in range(max_devices):
+            cap = None
+            try:
+                cap = cv2.VideoCapture(idx, backend)
+                if cap and cap.isOpened():
+                    detected.append(idx)
+            except Exception:
+                continue
+            finally:
+                if cap:
+                    cap.release()
+        return detected
+
+    def _refresh_cameras(self):
+        self._stop_camera_stream()
+        if not self.camera_combo:
+            return
+        if cv2 is None:
+            self.camera_combo.config(values=["OpenCV non disponibile"], state="disabled")
+            self.camera_combo.set("OpenCV non disponibile")
+            self._set_camera_status("Installa opencv-python per usare la webcam.")
+            self._set_camera_idle(False)
+            return
+        sources = self._detect_cameras()
+        self._camera_sources = sources
+        if sources:
+            values = [f"Camera {idx}" for idx in sources]
+            self.camera_combo.config(values=values, state="readonly")
+            self.camera_combo.current(0)
+            self._selected_camera.set(sources[0])
+            self._set_camera_status(f"Camere rilevate: {len(sources)}")
+            self._set_camera_idle(True)
+        else:
+            self.camera_combo.config(values=["Nessuna camera"], state="disabled")
+            self.camera_combo.set("Nessuna camera")
+            self._selected_camera.set(-1)
+            self._set_camera_status("Nessuna camera rilevata")
+            self._set_camera_idle(False)
+
+    def _on_camera_selected(self, event=None):
+        if not self.camera_combo:
+            return
+        idx = self.camera_combo.current()
+        if 0 <= idx < len(self._camera_sources):
+            selected = self._camera_sources[idx]
+            self._selected_camera.set(selected)
+            self._set_camera_status(f"Camera selezionata: {selected}")
+        else:
+            self._selected_camera.set(-1)
+        if self._camera_capture:
+            self._stop_camera_stream()
+
+    def _get_selected_camera_index(self) -> int | None:
+        idx = self._selected_camera.get()
+        return idx if idx >= 0 else None
+
+    def on_start_camera_preview(self):
+        if cv2 is None:
+            messagebox.showerror("Webcam", "Installa il pacchetto opencv-python per usare la webcam.")
+            return
+        idx = self._get_selected_camera_index()
+        if idx is None:
+            messagebox.showwarning("Webcam", "Seleziona una camera prima di avviare l'anteprima.")
+            return
+        self._start_camera_stream(idx)
+
+    def _start_camera_stream(self, index: int):
+        if cv2 is None:
+            return
+        self._stop_camera_stream()
+        backend = getattr(cv2, "CAP_DSHOW", getattr(cv2, "CAP_ANY", 0))
+        try:
+            cap = cv2.VideoCapture(index, backend)
+        except Exception as exc:
+            messagebox.showerror("Webcam", f"Errore apertura camera {index}: {exc}")
+            return
+        if not cap or not cap.isOpened():
+            if cap:
+                cap.release()
+            messagebox.showerror("Webcam", f"Impossibile aprire la camera {index}.")
+            return
+        self._camera_capture = cap
+        self._set_camera_running()
+        self._set_camera_status(f"Anteprima attiva su camera {index}")
+        self._schedule_camera_frame()
+
+    def _schedule_camera_frame(self):
+        if cv2 is None or not self._camera_capture:
+            return
+        ok, frame = self._camera_capture.read()
+        if not ok:
+            self._stop_camera_stream("Errore lettura webcam")
+            messagebox.showwarning("Webcam", "Impossibile leggere frame dalla webcam.")
+            return
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        self._live_camera_image = Image.fromarray(frame)
+        self._draw_input_preview(self._live_camera_image)
+        self._camera_preview_job = self.after(40, self._schedule_camera_frame)
+
+    def _stop_camera_stream(self, status: str | None = None):
+        was_running = self._camera_capture is not None or self._camera_preview_job is not None
+        if self._camera_preview_job:
+            try:
+                self.after_cancel(self._camera_preview_job)
+            except Exception:
+                pass
+            self._camera_preview_job = None
+        if self._camera_capture:
+            try:
+                self._camera_capture.release()
+            except Exception:
+                pass
+            self._camera_capture = None
+        self._live_camera_image = None
+        available = bool(self._camera_sources) and cv2 is not None
+        self._set_camera_idle(available)
+        if status:
+            self._set_camera_status(status)
+        elif was_running:
+            self._set_camera_status("Webcam ferma")
+        self._render_input_preview()
+
+    def on_capture_from_camera(self):
+        if self._live_camera_image is None:
+            messagebox.showwarning("Webcam", "Avvia la webcam e attendi che compaia l'anteprima.")
+            return
+        self.loaded_image = self._live_camera_image.copy()
+        self._stop_camera_stream("Immagine catturata dalla webcam")
+        self._after_new_input_image()
+
+    def _on_close(self):
+        self._stop_camera_stream()
+        try:
+            self.destroy()
+        except Exception:
+            pass
